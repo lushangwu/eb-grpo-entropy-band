@@ -1,0 +1,408 @@
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index ce4879e..ef6f676 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -82,6 +82,18 @@ actor_rollout_ref:
+     loss_agg_mode: token-mean
+     loss_scale_factor: null
+     entropy_coeff: 0
++    eb_enabled: false
++    eb_h_lo: 0.20
++    eb_h_hi: 0.40
++    eb_band_relative: false
++    eb_h_ref: 0.0
++    eb_coeff_max: 0.01
++    eb_eps_high_max: 0.28
++    eb_k_p: 4.0
++    eb_k_i: 0.5
++    eb_leak: 0.95
++    eb_i_clamp: 8.0
++    eb_log_file: ""
+     calculate_entropy: false
+     calculate_sum_pi_squared: false
+     use_kl_loss: false
+diff --git a/verl/trainer/config/actor/actor.yaml b/verl/trainer/config/actor/actor.yaml
+index 03ef392..87b78d4 100644
+--- a/verl/trainer/config/actor/actor.yaml
++++ b/verl/trainer/config/actor/actor.yaml
+@@ -87,6 +87,18 @@ loss_scale_factor: null
+ 
+ # Entropy regularization coefficient in PPO loss
+ entropy_coeff: 0
++eb_enabled: false
++eb_h_lo: 0.20
++eb_h_hi: 0.40
++eb_band_relative: false
++eb_h_ref: 0.0
++eb_coeff_max: 0.01
++eb_eps_high_max: 0.28
++eb_k_p: 4.0
++eb_k_i: 0.5
++eb_leak: 0.95
++eb_i_clamp: 8.0
++eb_log_file: ""
+ 
+ # When true, the actor forward will request entropy from the model
+ calculate_entropy: false
+diff --git a/verl/workers/config/actor.py b/verl/workers/config/actor.py
+index ed80a55..16b6cbe 100644
+--- a/verl/workers/config/actor.py
++++ b/verl/workers/config/actor.py
+@@ -144,6 +144,9 @@ class ActorConfig(BaseConfig):
+         "ppo_infer_micro_batch_size_per_gpu",
+         "engine",
+         "model_config",
++        # EB-GRPO 执行器：控制器逐步改写（见 verl/base_config.py 的 _mutable_fields 约定）
++        "entropy_coeff",
++        "clip_ratio_high",
+     }
+ 
+     strategy: str = MISSING
+@@ -163,6 +166,18 @@ class ActorConfig(BaseConfig):
+     loss_agg_mode: str = "token-mean"
+     loss_scale_factor: Optional[int] = None
+     entropy_coeff: float = 0
++    eb_enabled: bool = False
++    eb_h_lo: float = 0.20
++    eb_h_hi: float = 0.40
++    eb_band_relative: bool = False
++    eb_h_ref: float = 0.0
++    eb_coeff_max: float = 0.01
++    eb_eps_high_max: float = 0.28
++    eb_k_p: float = 4.0
++    eb_k_i: float = 0.5
++    eb_leak: float = 0.95
++    eb_i_clamp: float = 8.0
++    eb_log_file: str = ""
+     tau_pos: float = 1.0
+     tau_neg: float = 1.05
+     calculate_entropy: bool = False
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index bf379b4..111ae9c 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -582,6 +582,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 )
+             else:
+                 self.loss_fn = partial(ppo_loss, config=actor_config)
++                self._eb_actor_config = actor_config
+             self.actor = TrainingWorker(config=actor_training_config)
+             self.actor.reset()
+             self.actor.set_loss_fn(self.loss_fn)
+@@ -650,8 +651,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+     @DistProfiler.annotate(color="red", role="actor_update")
+     @_with_routing_replay_flag(enabled=True)
+     def update_actor(self, data: TensorDict) -> TensorDict:
++        from verl.workers.utils.eb_bridge import eb_step_begin, eb_step_end
++
++        cfg = getattr(self, "_eb_actor_config", None)
++        eb_step_begin(cfg)
+         output = self.actor.train_mini_batch(data=data)
+-        return output.cpu() if output is not None else None
++        out = output.cpu() if output is not None else None
++        eb_step_end(cfg, out)
++        return out
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+diff --git a/verl/workers/utils/eb_bridge.py b/verl/workers/utils/eb_bridge.py
+new file mode 100644
+index 0000000..ea1c419
+--- /dev/null
++++ b/verl/workers/utils/eb_bridge.py
+@@ -0,0 +1,164 @@
++"""EB-GRPO 训练桥（由 install_eb_patch.py 安装到 verl/workers/utils/eb_bridge.py）。
++
++职责：
++- eb_step_begin(cfg)：每个 optimizer step 开始时调用。用上一步观测的
++  token 平均策略熵更新熵带控制器，把控制量写回 worker 持有的 ActorConfig
++  （entropy_coeff / clip_ratio_high）。ppo_loss 每个微批实时读同一个
++  config 对象，因此本步内所有损失计算都用新参数。首步无观测：保持配置初值（中性）。
++- eb_step_end(cfg, output)：step 结束时调用。从 train_mini_batch 返回的
++  non-tensor `metrics`（{name: [Metric|float, ...]}，每个微批一条）用 verl
++  自带的 reduce_metrics 聚合成标量，① 取 token 平均熵存为下一步观测；
++  ② 把 {step, entropy, u, entropy_coeff, clip_higher, ...} 追加到 JSONL 日志。
++
++说明：
++- 反馈存在一步延迟（t 步的参数由 t-1 步的熵决定）——PI 控制器带宽远低
++  于训练步频，论文方法章按采样控制论述，不影响机制。
++- 熵在 verl 里是正值（losses.py: policy_loss -= entropy_coeff * entropy_loss），
++  与控制器观测约定一致。
++- baseline/fixed 组（eb_enabled=False）不做任何控制动作，但仍写日志，
++  使三组有同构的过程指标序列（论文绘图的数据契约）。
++- 多 DP rank 时各 rank 独立更新会造成参数分歧，且每 rank 各写一行；本实验为
++  单卡（dp=1），日志只在 rank0 写；多卡扩展留待未来工作（论文局限已声明）。
++"""
++
++from __future__ import annotations
++
++import json
++import os
++
++_STATE = {
++    "controller": None,
++    "last_entropy": None,
++    "step": 0,
++    "warned": False,
++}
++
++# 日志字段名 -> verl 聚合后指标名（按候选顺序取第一个命中的）
++_METRIC_SLOTS = {
++    "entropy": ("actor/entropy_loss", "actor/entropy"),
++    "kl_loss": ("kl_loss", "actor/kl_loss"),
++    "ppo_kl": ("actor/ppo_kl", "ppo_kl"),
++    "clipfrac": ("actor/pg_clipfrac", "pg_clipfrac"),
++    "clipfrac_lower": ("actor/pg_clipfrac_lower", "pg_clipfrac_lower"),
++    "pg_loss": ("actor/pg_loss", "pg_loss"),
++    "grad_norm": ("actor/grad_norm", "grad_norm"),
++}
++
++
++def _is_log_rank() -> bool:
++    try:
++        import torch.distributed as dist
++
++        if dist.is_available() and dist.is_initialized():
++            return dist.get_rank() == 0
++    except Exception:
++        pass
++    return True
++
++
++def _ensure_controller(cfg):
++    if _STATE["controller"] is None:
++        from verl.workers.utils.eb_entropy_controller import EntropyBandController
++
++        _STATE["controller"] = EntropyBandController(
++            h_lo=float(cfg.eb_h_lo),
++            h_hi=float(cfg.eb_h_hi),
++            coeff_max=float(cfg.eb_coeff_max),
++            eps_base=0.2,
++            eps_high_max=float(cfg.eb_eps_high_max),
++            k_p=float(cfg.eb_k_p),
++            k_i=float(cfg.eb_k_i),
++            leak=float(cfg.eb_leak),
++            i_clamp=float(cfg.eb_i_clamp),
++            band_relative=bool(cfg.eb_band_relative),
++            h_ref=float(cfg.eb_h_ref),
++        )
++
++
++def eb_step_begin(cfg) -> None:
++    if cfg is None or not getattr(cfg, "eb_enabled", False):
++        return
++    _ensure_controller(cfg)
++    if _STATE["last_entropy"] is None:
++        return  # 首步无观测：保持配置初值
++    sig = _STATE["controller"].update(_STATE["last_entropy"])
++    cfg.entropy_coeff = sig.entropy_coeff
++    cfg.clip_ratio_high = sig.clip_higher
++
++
++def _reduce(output):
++    """把 train_mini_batch 返回的 per-micro-batch 指标聚合成 {name: float}。"""
++    from verl.utils import tensordict_utils as tu
++    from verl.utils.metric import reduce_metrics
++
++    metrics = tu.get(output, "metrics")
++    if not metrics:
++        return {}
++    flat = reduce_metrics(dict(metrics))
++    out = {}
++    for key, val in flat.items():
++        try:
++            out[key] = float(val)
++        except (TypeError, ValueError):
++            continue  # 跳过非数值项
++    return out
++
++
++def eb_step_end(cfg, output) -> None:
++    if cfg is None or output is None:
++        return
++    try:
++        flat = _reduce(output)
++    except Exception as exc:  # 诊断用：让第一步就把取不到指标的问题暴露到 stdout
++        if not _STATE["warned"]:
++            print(f"[eb_bridge] 聚合指标失败：{exc!r}", flush=True)
++            _STATE["warned"] = True
++        return
++
++    h = None
++    for name in _METRIC_SLOTS["entropy"]:
++        if name in flat:
++            h = flat[name]
++            break
++    if h is None:
++        if not _STATE["warned"]:
++            print(f"[eb_bridge] 返回指标里没有熵，可用键={sorted(flat)}", flush=True)
++            _STATE["warned"] = True
++        return
++
++    if getattr(cfg, "eb_enabled", False):
++        _STATE["last_entropy"] = h
++    _STATE["step"] += 1
++
++    log_file = getattr(cfg, "eb_log_file", "") or ""
++    if not log_file or not _is_log_rank():
++        return
++
++    hist = _STATE["controller"].history if _STATE["controller"] is not None else []
++    sig = hist[-1] if hist else None  # 首步控制器尚未动作：无控制信号
++    rec = {
++        "step": _STATE["step"],
++        "entropy": h,
++        "u": getattr(sig, "u", 0.0),
++        "entropy_coeff": float(cfg.entropy_coeff),
++        "clip_higher": float(cfg.clip_ratio_high),
++    }
++    if sig is not None:
++        rec["error"] = getattr(sig, "error", None)
++        rec["integral"] = getattr(sig, "integral", None)
++    ctrl = _STATE["controller"]
++    if ctrl is not None:
++        # 本步实际生效的绝对熵带（相对带模式下由参考熵折算而来）
++        rec["band_lo"] = float(ctrl.h_lo)
++        rec["band_hi"] = float(ctrl.h_hi)
++        rec["h_ref"] = float(ctrl.h_ref)
++    for field, names in _METRIC_SLOTS.items():
++        if field == "entropy":
++            continue
++        for name in names:
++            if name in flat:
++                rec[field] = flat[name]
++                break
++    os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
++    with open(log_file, "a", encoding="utf-8") as f:
++        f.write(json.dumps(rec) + "\n")
+diff --git a/verl/workers/utils/eb_entropy_controller.py b/verl/workers/utils/eb_entropy_controller.py
+new file mode 100644
+index 0000000..aa75d21
+--- /dev/null
++++ b/verl/workers/utils/eb_entropy_controller.py
+@@ -0,0 +1,125 @@
++"""EB-GRPO 熵带控制器（Entropy-Band GRPO）——论文自研算法的核心模块。
++
++纯标准库实现，可在无 GPU 环境下开发与单测；训练时作为 verl 策略更新
++外挂的反馈控制器（集成方式见 README_EB_GRPO.md）。
++
++设计要点（与论文第 4 章一一对应）：
++- 观测量：每步 rollout 的 token 级平均策略熵 H_t（nats）；
++- 死区：熵落在目标带 [h_lo, h_hi] 内时误差为 0，不动作，避免抖动；
++- 误差（方向约定：正 = 探索不足）：
++      带下方（H_t < h_lo）: e = h_lo - H_t   （>0，需要鼓励探索）
++      带上方（H_t > h_hi）: e = -(H_t - h_hi)（<0，需要抑制）
++- 控制律（比例-积分，含抗饱和与泄漏）：
++      I_t = clamp(leak * I_{t-1} + e_t, -i_clamp, +i_clamp)
++      u_t = clip(k_p * e_t + k_i * I_t, -1, +1)
++- 双执行器（**双向**，2026-10-24 预跑实测后由非对称改为对称）：
++      entropy_coeff = u * coeff_max                       # u>0 熵奖励，u<0 熵惩罚
++      clip_higher   = eps_base + max(0, u) * (eps_high_max - eps_base)
++  两个执行器的分工是不对称的：熵系数双向，裁剪只单向放宽——clip-higher 的
++  语义（DAPO，arXiv 2503.14476）本来就是"放宽正优势 token 的更新上界以放开
++  探索"，反向收紧等价于回到默认对称裁剪 0.2，因此抑制方向只动用熵系数。
++  改双向的实测依据：0.5B/1.5B base 模型在 4 个数 Countdown 上 vanilla GRPO 的
++  熵是**单调上升并飘出带外**（1.80→2.36 nats），只抬不压的控制器对整个训练
++  过程完全不动作，无法构成"维持熵在带内"的验证。
++
++熵带的两种给法（对应论文 §4.2 取值表）：
++- 绝对带（band_relative=False）：直接给 [h_lo, h_hi]（nats）。
++- 相对带（band_relative=True）：h_lo/h_hi 解释为**初始熵的比例**，
++  带宽 = [r_lo, r_hi] × H_ref。H_ref 优先取显式给定的 h_ref；为 0 时用
++  控制器收到的第一个观测熵自标定。跨模型规模（0.5B / 1.5B 初始熵不同）
++  因此不需要逐模型重设常数，这正是"少先验调参"主张的实现。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++
++@dataclass
++class ControlSignal:
++    """单步控制信号（完整记录，供训练日志与论文绘图使用）。"""
++
++    step: int
++    entropy: float      # 观测熵 H_t
++    error: float        # 方向化误差 e_t
++    integral: float     # 积分项 I_t
++    u: float            # 归一化控制量
++    entropy_coeff: float
++    clip_higher: float
++
++
++class EntropyBandController:
++    def __init__(
++        self,
++        h_lo: float,
++        h_hi: float,
++        coeff_max: float = 0.01,
++        eps_base: float = 0.2,
++        eps_high_max: float = 0.28,
++        k_p: float = 4.0,
++        k_i: float = 0.5,
++        i_clamp: float = 8.0,
++        leak: float = 0.95,
++        band_relative: bool = False,
++        h_ref: float = 0.0,
++    ):
++        # 绝对带时 h_* 是 nats；相对带时是初始熵的比例，取值约束相同
++        if not (0.0 < h_lo < h_hi):
++            raise ValueError("要求 0 < h_lo < h_hi（相对带时为 0 < 比例下界 < 上界）")
++        if h_ref < 0.0:
++            raise ValueError("h_ref 不允许为负；0 表示用首个观测自标定")
++        self.band_relative = band_relative
++        self.r_lo, self.r_hi = h_lo, h_hi
++        if band_relative:
++            # h_ref>0：立刻折算；h_ref=0：等第一个观测熵到来时折算
++            self.h_ref = h_ref
++            self.h_lo = h_lo * h_ref
++            self.h_hi = h_hi * h_ref
++        else:
++            self.h_ref = 0.0
++            self.h_lo = h_lo
++            self.h_hi = h_hi
++        self.coeff_max = coeff_max
++        self.eps_base = eps_base
++        self.eps_high_max = eps_high_max
++        self.k_p = k_p
++        self.k_i = k_i
++        self.i_clamp = i_clamp
++        self.leak = leak
++        self.integral = 0.0
++        self.history: list[ControlSignal] = []
++        self._step = 0
++
++    def error_of(self, h: float) -> float:
++        """方向化误差：带下方为正（探索不足），带上方为负，带内为 0。"""
++        if h < self.h_lo:
++            return self.h_lo - h
++        if h > self.h_hi:
++            return -(h - self.h_hi)
++        return 0.0
++
++    def update(self, entropy: float) -> ControlSignal:
++        if self.band_relative and self.h_ref == 0.0:
++            # 自标定：以收到的第一个观测熵为参考熵 H0，把比例带宽折算成绝对带宽
++            if entropy <= 0.0:
++                raise ValueError("相对带的参考熵必须为正")
++            self.h_ref = entropy
++            self.h_lo = self.r_lo * entropy
++            self.h_hi = self.r_hi * entropy
++        e = self.error_of(entropy)
++        # 泄漏 + 抗饱和：带内误差为 0，积分按 leak 衰减回零，防止 windup
++        self.integral = max(-self.i_clamp, min(self.i_clamp, self.leak * self.integral + e))
++        u = max(-1.0, min(1.0, self.k_p * e + self.k_i * self.integral))
++        boost = max(0.0, u)
++        sig = ControlSignal(
++            step=self._step,
++            entropy=entropy,
++            error=e,
++            integral=self.integral,
++            u=u,
++            entropy_coeff=u * self.coeff_max,
++            clip_higher=self.eps_base + boost * (self.eps_high_max - self.eps_base),
++        )
++        self.history.append(sig)
++        self._step += 1
++        return sig
